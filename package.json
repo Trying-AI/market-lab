@@ -1,0 +1,14 @@
+{
+  "name": "folio-strategy-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A free, local-first options strategy playground.",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check src/app.js && node --check src/engine.js && node --check src/data.js"
+  },
+  "engines": { "node": ">=20" }
+}
