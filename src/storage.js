@@ -6,6 +6,11 @@ const MAX_POSITIONS = 500;
 const MAX_LEGS = 24;
 const MAX_BACKUP_CHARS = 12_000_000;
 const knownMarkets = new Set(MARKETS.map(market => market.symbol));
+// These sizes belong to the original demo snapshot. Never migrate an old entry
+// using a current instrument master: that would change its economic quantity.
+const LEGACY_LOT_SIZES = Object.freeze({ NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 });
+const ENTRY_SOURCES = new Set(['legacy-demo', 'upstox', 'manual']);
+const IV_SOURCES = new Set(['provider', 'calibrated', 'manual', 'unavailable']);
 let nextId = 0;
 
 function fail(message) {
@@ -62,23 +67,64 @@ function timestamp(value, fallback, label) {
   return date.toISOString();
 }
 
-function validateLeg(input, expiry, index) {
+function isoTimestamp(value, label) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    fail(`${label} must be an ISO timestamp with a timezone.`);
+  }
+  const day = value.slice(0, 10);
+  const midnight = Date.parse(`${day}T00:00:00Z`);
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(midnight) || !Number.isFinite(parsed) || new Date(midnight).toISOString().slice(0, 10) !== day) {
+    fail(`${label} must be a real ISO timestamp.`);
+  }
+  return new Date(parsed).toISOString();
+}
+
+function enumValue(value, allowed, label) {
+  if (!allowed.has(value)) fail(`${label} must be ${[...allowed].join(', ')}.`);
+  return value;
+}
+
+function validateLeg(input, expiry, index, marketSymbol, dataMode) {
   const label = `Leg ${index + 1}`;
   record(input, label);
   if (input.side !== 'buy' && input.side !== 'sell') fail(`${label} side must be buy or sell.`);
   if (input.type !== 'CE' && input.type !== 'PE') fail(`${label} type must be CE or PE.`);
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') fail(`${label} enabled state must be true or false.`);
-  return {
+  const lots = numberInRange(input.lots, `${label} lots`, 1, 100, true);
+  const legacy = input.lotSize === undefined && input.quantityUnits === undefined && dataMode !== 'live' && input.entryPriceSource !== 'upstox';
+  const entryPriceSource = input.entryPriceSource === undefined
+    ? (legacy ? 'legacy-demo' : undefined)
+    : enumValue(input.entryPriceSource, ENTRY_SOURCES, `${label} entry price source`);
+  const result = {
     id: identifier(input.id, 'leg'),
     side: input.side,
     type: input.type,
     strike: numberInRange(input.strike, `${label} strike`, Number.MIN_VALUE, 10_000_000),
-    lots: numberInRange(input.lots, `${label} lots`, 1, 100, true),
+    lots,
     premium: numberInRange(input.premium, `${label} premium`, 0, 10_000_000),
-    iv: numberInRange(input.iv, `${label} IV`, 0.1, 300),
+    iv: input.iv === null && (entryPriceSource === 'upstox' || (entryPriceSource === 'manual' && dataMode === 'live')) ? null : numberInRange(input.iv, `${label} IV`, 0.1, 300),
     expiry: expiryDate(input.expiry ?? expiry, `${label} expiry`),
     enabled: input.enabled ?? true,
   };
+  if (input.contractId !== undefined) {
+    const contractId = boundedString(input.contractId, `${label} contract ID`, 160, { trim: true });
+    if (!/^[A-Z][A-Z0-9_]{0,29}\|[^|\r\n]+$/.test(contractId)) fail(`${label} contract ID must use the exchange|instrument format.`);
+    result.contractId = contractId;
+  }
+  if (input.lotSize !== undefined) result.lotSize = numberInRange(input.lotSize, `${label} lot size`, 1, 1_000_000, true);
+  else if (legacy) result.lotSize = LEGACY_LOT_SIZES[marketSymbol];
+  if (input.quantityUnits !== undefined) result.quantityUnits = numberInRange(input.quantityUnits, `${label} quantity units`, 1, 100_000_000, true);
+  else if (result.lotSize !== undefined) result.quantityUnits = lots * result.lotSize;
+  if (entryPriceSource !== undefined) result.entryPriceSource = entryPriceSource;
+  if (input.exchange !== undefined) result.exchange = boundedString(input.exchange, `${label} exchange`, 30, { trim: true });
+  if (input.quoteSource !== undefined) result.quoteSource = boundedString(input.quoteSource, `${label} quote source`, 30, { trim: true });
+  if (input.ivSource !== undefined) result.ivSource = enumValue(input.ivSource, IV_SOURCES, `${label} IV source`);
+  if (input.entryAt !== undefined) result.entryAt = isoTimestamp(input.entryAt, `${label} entry time`);
+  if (input.snapshotAt !== undefined) result.snapshotAt = isoTimestamp(input.snapshotAt, `${label} snapshot time`);
+  if (input.expiresAt !== undefined) result.expiresAt = isoTimestamp(input.expiresAt, `${label} expiry time`);
+  if (input.settlementPrice !== undefined) result.settlementPrice = numberInRange(input.settlementPrice, `${label} settlement price`, 0, 10_000_000);
+  return result;
 }
 
 function validateRecord(input, minimumLegs) {
@@ -86,14 +132,15 @@ function validateRecord(input, minimumLegs) {
   const name = boundedString(input.name, 'Position name', 80, { trim: true });
   if (!knownMarkets.has(input.marketSymbol)) fail('Position market must be NIFTY, BANKNIFTY, or SENSEX.');
   const expiry = expiryDate(input.expiry, 'Position expiry');
+  const dataMode = input.dataMode === undefined ? undefined : enumValue(input.dataMode, new Set(['demo', 'live']), 'Position data mode');
   if (!Array.isArray(input.legs) || input.legs.length < minimumLegs || input.legs.length > MAX_LEGS) {
     fail(`A ${minimumLegs === 0 ? 'workspace' : 'position'} must contain ${minimumLegs}–${MAX_LEGS} option legs.`);
   }
-  const legs = Array.from(input.legs, (leg, index) => validateLeg(leg, expiry, index));
+  const legs = Array.from(input.legs, (leg, index) => validateLeg(leg, expiry, index, input.marketSymbol, dataMode));
   if (new Set(legs.map(leg => leg.id)).size !== legs.length) fail('Each leg in a position must have a unique ID.');
   const now = new Date().toISOString();
   const createdAt = timestamp(input.createdAt, now, 'Created date');
-  return {
+  const result = {
     id: identifier(input.id, 'position'),
     name,
     marketSymbol: input.marketSymbol,
@@ -104,6 +151,9 @@ function validateRecord(input, minimumLegs) {
     updatedAt: timestamp(input.updatedAt, createdAt, 'Updated date'),
     rate: numberInRange(input.rate ?? DEFAULT_RATE, 'Interest rate', -1, 1),
   };
+  if (dataMode !== undefined) result.dataMode = dataMode;
+  if (input.baseDate !== undefined) result.baseDate = isoTimestamp(input.baseDate, 'Position base date');
+  return result;
 }
 
 /** Return a fresh, allowlisted saved position containing at least one leg. */
@@ -136,7 +186,7 @@ export function parseImport(jsonString) {
   }
   if (Array.isArray(parsed)) return validatePositions(parsed);
   record(parsed, 'Backup');
-  if (parsed.version !== 1) fail('This backup version is not supported. Use a Folio version 1 backup.');
+  if (parsed.version !== 1 && parsed.version !== 2) fail('This backup version is not supported. Use a Folio version 1 or 2 backup.');
   return validatePositions(parsed.positions);
 }
 
@@ -184,5 +234,5 @@ export function writePositions(positions, storage) {
 }
 
 export function makeBackup(positions) {
-  return JSON.stringify({ app: 'Folio', version: 1, exportedAt: new Date().toISOString(), positions: validatePositions(positions) }, null, 2);
+  return JSON.stringify({ app: 'Folio', version: 2, exportedAt: new Date().toISOString(), positions: validatePositions(positions) }, null, 2);
 }

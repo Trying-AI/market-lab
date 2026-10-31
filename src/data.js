@@ -1,4 +1,4 @@
-import { DEMO_DATE, expiryYears, optionPrice } from './engine.js';
+import { DEMO_DATE, expiryYears, optionPrice, impliedVolatility } from './engine.js';
 
 // Illustrative market data, not exchange quotes or current contract specifications.
 export const MARKETS = [
@@ -7,11 +7,18 @@ export const MARKETS = [
   { symbol: 'SENSEX', name: 'BSE Sensex', spot: 80312.5, change: 427.9, changePercent: 0.54, lotSize: 20, step: 100, iv: 13.8 },
 ];
 
+export const DEMO_MARKETS = structuredClone(MARKETS);
+
 export const EXPIRIES = [
   { value: '2026-10-30', label: '30 Oct 2026', short: '30 Oct' },
   { value: '2026-11-06', label: '06 Nov 2026', short: '06 Nov' },
   { value: '2026-11-27', label: '27 Nov 2026', short: '27 Nov' },
 ];
+
+export const DEMO_EXPIRIES = structuredClone(EXPIRIES);
+let mode = 'demo';
+const contractCache = new Map();
+const chainCache = new Map();
 
 export const STRATEGIES = [
   { id: 'bull-call', name: 'Bull call spread', outlook: 'Bullish', level: 'Beginner', kind: 'bull-call', description: 'A measured rise, with a defined cost and reward.', points: '2,34 24,34 48,10 70,10' },
@@ -50,6 +57,7 @@ function premiumFor(market, strike, expiry, iv, type) {
 
 export function makeLeg(market = MARKETS[0], expiry = EXPIRIES[0].value, overrides = {}) {
   const instrument = resolveMarket(market);
+  if (mode === 'live') return makeMarketLeg(instrument, expiry, overrides);
   const strike = overrides.strike ?? atTheMoney(instrument);
   const type = overrides.type ?? 'CE';
   const legExpiry = overrides.expiry ?? expiry;
@@ -65,6 +73,10 @@ export function makeLeg(market = MARKETS[0], expiry = EXPIRIES[0].value, overrid
     expiry: legExpiry,
     iv,
     premium: overrides.premium ?? premiumFor(instrument, strike, legExpiry, iv, type),
+    lotSize: instrument.lotSize,
+    quantityUnits: (overrides.lots ?? 1) * instrument.lotSize,
+    entryPriceSource: 'legacy-demo',
+    ivSource: 'manual',
   };
 }
 
@@ -103,8 +115,13 @@ export function makeStrategy(presetId = 'bull-call', market = MARKETS[0], expiry
   }
 }
 
-export function getChain(market = MARKETS[0], expiry = EXPIRIES[0].value) {
+export function getChain(market = MARKETS[0], expiry = EXPIRIES[0]?.value) {
   const instrument = resolveMarket(market);
+  if (mode === 'live') {
+    const rows = chainCache.get(`${instrument.symbol}|${expiry}`)?.rows || [];
+    const nearest = rows.reduce((best, row, i) => Math.abs(row.strike - instrument.spot) < Math.abs(rows[best].strike - instrument.spot) ? i : best, 0);
+    return rows.slice(Math.max(0, nearest - 12), nearest + 13);
+  }
   const atm = atTheMoney(instrument);
   return Array.from({ length: 17 }, (_, index) => {
     const distance = index - 8;
@@ -122,4 +139,73 @@ export function getChain(market = MARKETS[0], expiry = EXPIRIES[0].value) {
     };
     return { strike, call: quote('CE'), put: quote('PE') };
   });
+}
+
+
+/** Demo and authenticated market data are deliberately separate. */
+export function getDataMode() { return mode; }
+export function setDataMode(next) {
+  if (!['demo', 'live'].includes(next)) throw new Error('Unknown data mode.');
+  mode = next;
+  MARKETS.splice(0, MARKETS.length, ...structuredClone(DEMO_MARKETS).map(m => next === 'demo' ? m : {...m, spot:null, change:null, changePercent:null, lotSize:null, iv:null, asOf:null, quoteAvailable:false}));
+  EXPIRIES.splice(0, EXPIRIES.length, ...(next === 'demo' ? structuredClone(DEMO_EXPIRIES) : []));
+  if (next === 'live') { contractCache.clear(); chainCache.clear(); }
+}
+export function applyIndexQuotes(indices) {
+  for (const m of MARKETS) {
+    const quote = indices[m.symbol];
+    if (!quote || !Number.isFinite(quote.spot)) { m.quoteAvailable=false; continue; }
+    Object.assign(m, quote, {quoteAvailable:true});
+  }
+}
+export function setContracts(symbol, contracts) { contractCache.set(symbol, contracts); }
+export function getContracts(symbol) { return contractCache.get(symbol) || []; }
+export function selectMarketExpiries(symbol, now = new Date().toISOString()) {
+  if (mode === 'demo') return;
+  const dates = [...new Set(getContracts(symbol).filter(c => Date.parse(c.expiry+'T10:00:00Z') > Date.parse(now)).map(c => c.expiry))].sort();
+  EXPIRIES.splice(0, EXPIRIES.length, ...dates.map(value => ({value, label:new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'}), short:new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',timeZone:'Asia/Kolkata'})})));
+}
+export function setChain(snapshot) {
+  chainCache.set(`${snapshot.symbol}|${snapshot.expiry}`, snapshot);
+  const m = resolveMarket(snapshot.symbol);
+  if (Number.isFinite(snapshot.spot)) m.spot = snapshot.spot;
+  const contracts = getContracts(snapshot.symbol).filter(c => c.expiry === snapshot.expiry);
+  const lotSizes = [...new Set(contracts.map(c => c.lotSize))];
+  m.lotSize = lotSizes.length === 1 ? lotSizes[0] : null;
+  const strikes = [...new Set(contracts.map(c => c.strike))].sort((a,b)=>a-b);
+  if (strikes.length > 1) m.step = Math.min(...strikes.slice(1).map((v,i)=>v-strikes[i]));
+  const ivs = [...snapshot.rows].sort((a,b)=>Math.abs(a.strike-m.spot)-Math.abs(b.strike-m.spot)).slice(0,5).flatMap(row => [row.call?.iv,row.put?.iv]).filter(v=>Number.isFinite(v)&&v>=.1&&v<=300);
+  m.iv = ivs.length ? ivs.sort((a,b)=>a-b)[Math.floor(ivs.length/2)] : null;
+}
+export function getOptionQuote(symbol, expiry, strike, type) {
+  const row = chainCache.get(`${symbol}|${expiry}`)?.rows.find(row => row.strike === strike);
+  return row?.[type === 'CE' ? 'call' : 'put'] || null;
+}
+export function getStrikeOptions(symbol, expiry, type) {
+  if (mode === 'live') return [...new Set(getContracts(symbol).filter(c=>c.expiry===expiry&&c.type===type).map(c=>c.strike))].sort((a,b)=>a-b);
+  const m=resolveMarket(symbol), atm=Math.floor(m.spot/m.step)*m.step;
+  return Array.from({length:61},(_,i)=>atm+(i-30)*m.step).filter(k=>k>0);
+}
+function makeMarketLeg(market, expiry, overrides) {
+  const type = overrides.type || 'CE', selectedExpiry = overrides.expiry || expiry;
+  const options=getContracts(market.symbol).filter(c=>c.expiry===selectedExpiry&&c.type===type);
+  if (!options.length) throw new Error('No listed contracts are available for this index, expiry and type.');
+  const target=overrides.strike??market.spot;
+  const contract=overrides.strike===undefined?options.reduce((best,c)=>Math.abs(c.strike-target)<Math.abs(best.strike-target)?c:best,options[0]):options.find(c=>c.strike===overrides.strike);
+  if(!contract)throw new Error('This strategy needs a strike that is not listed for the selected expiry. Choose listed contracts from the chain instead.');
+  const quote=getOptionQuote(market.symbol,selectedExpiry,contract.strike,type);
+  if (!quote || !Number.isFinite(quote.premium)) throw new Error('No market price is available for that contract. Refresh the chain or choose another strike.');
+  const calibrated=Number.isFinite(quote.iv)&&quote.iv>0 ? null : impliedVolatility(quote.premium,market.spot,contract.strike,expiryYears(selectedExpiry,new Date().toISOString()),.06,type);
+  const candidateIv=Number.isFinite(quote.iv)&&quote.iv>0 ? quote.iv : Number.isFinite(calibrated)&&calibrated>0 ? calibrated*100 : null;
+  const iv=Number.isFinite(candidateIv)&&candidateIv>=.1&&candidateIv<=300?candidateIv:null;
+  const lots=overrides.lots??1;
+  return {
+    id:overrides.id||`leg-${Date.now().toString(36)}-${(++nextId).toString(36)}`,
+    side:overrides.side||'buy',type,strike:contract.strike,expiry:selectedExpiry,lots,
+    premium:overrides.premium??quote.premium,iv,
+    enabled:overrides.enabled??true,contractId:contract.contractId,
+    lotSize:contract.lotSize,quantityUnits:lots*contract.lotSize,exchange:contract.exchange,expiresAt:selectedExpiry+'T10:00:00Z',
+    entryPriceSource:'upstox',entryAt:new Date().toISOString(),
+    ivSource:iv===null?'unavailable':Number.isFinite(quote.iv)&&quote.iv>0?'provider':'calibrated'
+  };
 }
