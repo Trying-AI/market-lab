@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzeStrategy, daysToExpiry, DEMO_DATE, expiryPayoff, normalCDF, optionGreeks, optionPrice, scenarioPayoff } from '../src/engine.js';
+import { analyzeStrategy, daysToExpiry, DEMO_DATE, expiryPayoff, impliedVolatility, legUnits, markToMarket, normalCDF, optionGreeks, optionPrice, scenarioPayoff } from '../src/engine.js';
 
 const close = (actual, expected, tolerance = 1e-5) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} ≠ ${expected}`);
 const leg = (overrides = {}) => ({ id: 'test', side: 'buy', type: 'CE', strike: 100, expiry: '2026-11-26', lots: 1, premium: 5, iv: 20, enabled: true, ...overrides });
@@ -159,4 +159,140 @@ test('empty and fully disabled positions have zero exposure', () => {
     assert.deepEqual(result.breakevens, []);
     assert.equal(scenarioPayoff(legs, 100, 0, 0, 50), 0);
   }
+});
+
+test('saved unit quantities keep payoff and Greeks stable after current lot-size changes', () => {
+  const saved = leg({ lots: 2, lotSize: 65, quantityUnits: 130 });
+  const before = analyzeStrategy([saved], 100, 65, 20);
+  const after = analyzeStrategy([{ ...saved, lots: 99, lotSize: 30 }], 100, 30, 20);
+  assert.equal(legUnits(saved), 130);
+  assert.equal(legUnits({ ...saved, side: 'sell' }), -130);
+  assert.equal(expiryPayoff([saved], 110, 30), 650);
+  assert.equal(after.maxLoss, 650);
+  for (const field of ['netPremium', 'delta', 'gamma', 'theta', 'vega', 'rho']) close(after[field], before[field]);
+  close(scenarioPayoff([saved], 100, 2, 3, 30), scenarioPayoff([saved], 100, 2, 3, 65));
+});
+
+test('per-contract lot sizes prevent a false bounded spread when quantities differ', () => {
+  const legs = [leg({ lotSize: 65 }), leg({ side: 'sell', strike: 110, premium: 2, lotSize: 30 })];
+  assert.equal(legUnits(legs[0], 999), 65);
+  assert.equal(legUnits(legs[1], 999), -30);
+  assert.equal(analyzeStrategy(legs, 100, 999, 20).maxProfit, Infinity);
+  assert.equal(expiryPayoff(legs, 120, 999), 735);
+  assert.equal(legUnits(leg({ lots: 2 }), 50), 100);
+});
+
+test('LTP mark-to-market differs from modeled P&L without changing saved entries', () => {
+  const saved = leg({ contractId: 'NSE:test', lotSize: 50, quantityUnits: 100 });
+  const original = structuredClone(saved);
+  const result = markToMarket([saved], { 'NSE:test': { ltp: 9, asOf: DEMO_DATE } }, { asOf: DEMO_DATE });
+  assert.equal(result.total, 400);
+  assert.equal(result.partialTotal, 400);
+  assert.equal(result.complete, true);
+  assert.equal(result.legs[0].status, 'available');
+  assert.equal(result.oldestQuoteAt, '2026-10-26T06:30:00.000Z');
+  assert.ok(Math.abs(scenarioPayoff([saved], 100) - result.total) > 100);
+  assert.deepEqual(saved, original);
+});
+
+test('missing quotes keep totals unavailable while valid zero LTP and disabled legs behave correctly', () => {
+  const legs = [
+    leg({ id: 'zero', contractId: 'zero', quantityUnits: 100 }),
+    leg({ id: 'missing', contractId: 'missing', quantityUnits: 50 }),
+    leg({ id: 'disabled', enabled: false, contractId: 'disabled' }),
+  ];
+  const result = markToMarket(legs, { zero: { ltp: 0, asOf: DEMO_DATE } }, { asOf: DEMO_DATE });
+  assert.equal(result.total, null);
+  assert.equal(result.partialTotal, -500);
+  assert.equal(result.complete, false);
+  assert.equal(result.legs.length, 2);
+  assert.deepEqual(result.legs.map(row => row.status), ['available', 'missing']);
+  assert.equal(result.legs[0].price, 0);
+  assert.equal(result.legs[1].pl, null);
+  assert.equal(markToMarket([leg()], {}, { asOf: DEMO_DATE }).legs[0].status, 'missing');
+  assert.equal(markToMarket([], {}, { asOf: DEMO_DATE }).total, 0);
+});
+
+test('freshness requires a recent feed timestamp and a recent actual trade when supplied', () => {
+  const saved = leg({ contractId: 'test', quantityUnits: 50 });
+  const options = { asOf: '2026-10-26T06:30:00Z', marketStatus: 'open' };
+  const stale = markToMarket([saved], { test: { ltp: 7, asOf: '2026-10-26T06:28:29Z', receivedAt: options.asOf, lastTradedAt: options.asOf } }, options);
+  assert.equal(stale.total, null);
+  assert.equal(stale.partialTotal, 0);
+  assert.equal(stale.legs[0].status, 'stale');
+  assert.equal(stale.oldestQuoteAt, '2026-10-26T06:28:29.000Z');
+  const oldTrade = markToMarket([saved], { test: { ltp: 7, asOf: options.asOf, lastTradedAt: '2026-10-20T06:30:00Z' } }, options);
+  assert.equal(oldTrade.total, null);
+  assert.equal(oldTrade.legs[0].status, 'stale');
+  assert.equal(oldTrade.oldestQuoteAt, '2026-10-26T06:30:00.000Z');
+  assert.equal(oldTrade.oldestLastTradedAt, '2026-10-20T06:30:00.000Z');
+  const unknownTrade = markToMarket([saved], { test: { ltp: 7, asOf: options.asOf } }, options);
+  assert.equal(unknownTrade.total, 100);
+  assert.equal(unknownTrade.oldestLastTradedAt, null);
+  const noFeedTimestamp = markToMarket([saved], { test: { ltp: 7, receivedAt: options.asOf, lastTradedAt: options.asOf } }, options);
+  assert.equal(noFeedTimestamp.legs[0].status, 'missing');
+});
+
+test('closed-market valid quotes give a complete MTM explicitly labeled closed', () => {
+  const saved = leg({ contractId: 'test', quantityUnits: 50, side: 'sell' });
+  const result = markToMarket([saved], new Map([['test', { ltp: 7, asOf: '2026-10-30T10:00:00Z', lastTradedAt: '2026-10-29T09:00:00Z' }]]), { asOf: '2026-10-31T06:30:00Z', marketStatus: 'closed' });
+  assert.equal(result.total, -100);
+  assert.equal(result.complete, true);
+  assert.equal(result.legs[0].status, 'closed');
+  assert.equal(result.oldestQuoteAt, '2026-10-30T10:00:00.000Z');
+  assert.equal(result.oldestLastTradedAt, '2026-10-29T09:00:00.000Z');
+});
+
+test('expired unresolved contracts cannot be marked with a later quote', () => {
+  const expired = leg({ contractId: 'test', expiry: '2026-10-31', quantityUnits: 50 });
+  const quotes = { test: { ltp: 99, asOf: '2026-10-31T10:00:00Z' } };
+  const result = markToMarket([expired], quotes, { asOf: '2026-10-31T10:00:00Z', marketStatus: 'closed' });
+  assert.equal(result.total, null);
+  assert.equal(result.legs[0].status, 'expired');
+  assert.equal(result.legs[0].price, null);
+  const actualExpiry = { ...expired, expiresAt: '2026-10-31T09:00:00Z' };
+  assert.equal(markToMarket([actualExpiry], quotes, { asOf: '2026-10-31T09:00:00Z' }).legs[0].status, 'expired');
+});
+
+test('expired settlement locks P&L and removes future spot, time and Greek exposure', () => {
+  const settled = leg({ expiry: '2026-10-30', quantityUnits: 40, settlementPrice: 8 });
+  const asOf = '2026-10-31T06:30:00Z';
+  const marked = markToMarket([settled], {}, { asOf });
+  assert.equal(marked.total, 120);
+  assert.equal(marked.legs[0].status, 'available');
+  assert.equal(marked.oldestQuoteAt, null);
+  for (const spot of [0, 100, 1000]) {
+    assert.equal(scenarioPayoff([settled], spot, 100, 20, 999, 0.06, asOf), 120);
+    assert.equal(expiryPayoff([settled], spot, 999), 120);
+    const result = analyzeStrategy([settled], spot, 999, 20, 0.06, asOf);
+    for (const greek of ['delta', 'gamma', 'theta', 'vega', 'rho']) assert.equal(result[greek], 0);
+    assert.equal(result.maxProfit, 120);
+    assert.equal(result.maxLoss, 0);
+    assert.deepEqual(result.breakevens, []);
+  }
+  assert.equal(markToMarket([{ ...settled, settlementPrice: 0 }], {}, { asOf }).total, -200);
+});
+
+test('settled legs become fixed cash alongside a later active contract', () => {
+  const settled = leg({ expiry: '2026-10-30', quantityUnits: 40, settlementPrice: 8 });
+  const open = leg({ id: 'open', quantityUnits: 30, expiry: '2026-11-26' });
+  const asOf = '2026-10-31T06:30:00Z';
+  const together = analyzeStrategy([settled, open], 100, 999, 20, 0.06, asOf);
+  const activeOnly = analyzeStrategy([open], 100, 999, 20, 0.06, asOf);
+  assert.equal(together.analysisExpiry, '2026-11-26');
+  assert.equal(together.mixedExpiry, false);
+  for (const greek of ['delta', 'gamma', 'theta', 'vega', 'rho']) close(together[greek], activeOnly[greek]);
+  close(scenarioPayoff([settled, open], 110, 5, 2, 999, 0.06, asOf), scenarioPayoff([open], 110, 5, 2, 999, 0.06, asOf) + 120);
+});
+
+test('implied volatility recovers known call/put IV and rejects impossible or unidentifiable prices', () => {
+  for (const type of ['CE', 'PE']) {
+    const price = optionPrice(24_500, 24_600, 7 / 365, 0.142, 0.06, type);
+    close(impliedVolatility(price, 24_500, 24_600, 7 / 365, 0.06, type), 0.142, 1e-7);
+  }
+  assert.equal(impliedVolatility(0, 100, 110, 1, 0), 0);
+  for (const price of [-1, 100, 101, NaN]) assert.equal(impliedVolatility(price, 100, 100, 1, 0.06, 'CE'), null);
+  assert.equal(impliedVolatility(1, 100, 100, 0, 0.06, 'CE'), null);
+  assert.equal(impliedVolatility(1, 0, 100, 1, 0.06, 'CE'), null);
+  assert.equal(impliedVolatility(1, 100, 100, 1, 0.06, 'unknown'), null);
 });
