@@ -1,4 +1,4 @@
-import { DEMO_DATE, expiryYears, optionPrice, impliedVolatility } from './engine.js';
+import { expiryYears, optionPrice, impliedVolatility } from './engine.js';
 
 // Illustrative market data, not exchange quotes or current contract specifications.
 export const MARKETS = [
@@ -9,11 +9,21 @@ export const MARKETS = [
 
 export const DEMO_MARKETS = structuredClone(MARKETS);
 
-export const EXPIRIES = [
-  { value: '2026-10-30', label: '30 Oct 2026', short: '30 Oct' },
-  { value: '2026-11-06', label: '06 Nov 2026', short: '06 Nov' },
-  { value: '2026-11-27', label: '27 Nov 2026', short: '27 Nov' },
-];
+// Listed option expiries from Upstox's 9 Nov 2026 BOD contract files, through Jan 2027.
+// Weekly contracts can be added later by the exchange; this is a dated snapshot.
+export const SAMPLE_EXPIRY_DATES = Object.freeze({
+  NIFTY: Object.freeze(['2026-11-09','2026-11-17','2026-11-23','2026-12-01','2026-12-08','2026-12-29','2027-01-25']),
+  BANKNIFTY: Object.freeze(['2026-11-23','2026-12-29','2027-01-25']),
+  SENSEX: Object.freeze(['2026-11-12','2026-11-19','2026-11-26','2026-12-03','2026-12-10','2026-12-17','2026-12-24','2026-12-31','2027-01-28']),
+});
+export function sampleExpiries(symbol, now = new Date().toISOString()) {
+  return (SAMPLE_EXPIRY_DATES[symbol] || []).filter(value => Date.parse(value+'T10:00:00Z') > Date.parse(now)).map(value => ({
+    value,
+    label: new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'}),
+    short: new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',timeZone:'Asia/Kolkata'}),
+  }));
+}
+export const EXPIRIES = sampleExpiries('NIFTY');
 
 export const DEMO_EXPIRIES = structuredClone(EXPIRIES);
 let mode = 'demo';
@@ -52,12 +62,13 @@ function strikeIv(market, strike, type) {
 }
 
 function premiumFor(market, strike, expiry, iv, type) {
-  return round(Math.max(0.05, optionPrice(market.spot, strike, expiryYears(expiry, DEMO_DATE), iv / 100, 0.06, type)));
+  return round(Math.max(0.05, optionPrice(market.spot, strike, expiryYears(expiry, new Date().toISOString()), iv / 100, 0.06, type)));
 }
 
-export function makeLeg(market = MARKETS[0], expiry = EXPIRIES[0].value, overrides = {}) {
+export function makeLeg(market = MARKETS[0], expiry = EXPIRIES[0]?.value, overrides = {}) {
   const instrument = resolveMarket(market);
   if (mode === 'live') return makeMarketLeg(instrument, expiry, overrides);
+  if (!expiry && !overrides.expiry) throw new Error('No current sample expiries are available.');
   const strike = overrides.strike ?? atTheMoney(instrument);
   const type = overrides.type ?? 'CE';
   const legExpiry = overrides.expiry ?? expiry;
@@ -80,7 +91,7 @@ export function makeLeg(market = MARKETS[0], expiry = EXPIRIES[0].value, overrid
   };
 }
 
-export function makeStrategy(presetId = 'bull-call', market = MARKETS[0], expiry = EXPIRIES[0].value) {
+export function makeStrategy(presetId = 'bull-call', market = MARKETS[0], expiry = EXPIRIES[0]?.value) {
   const instrument = resolveMarket(market);
   const atm = atTheMoney(instrument);
   const wing = instrument.step * 6;
@@ -117,6 +128,7 @@ export function makeStrategy(presetId = 'bull-call', market = MARKETS[0], expiry
 
 export function getChain(market = MARKETS[0], expiry = EXPIRIES[0]?.value) {
   const instrument = resolveMarket(market);
+  if (!expiry) return [];
   if (mode === 'live') {
     const rows = chainCache.get(`${instrument.symbol}|${expiry}`)?.rows || [];
     const nearest = rows.reduce((best, row, i) => Math.abs(row.strike - instrument.spot) < Math.abs(rows[best].strike - instrument.spot) ? i : best, 0);
@@ -144,11 +156,15 @@ export function getChain(market = MARKETS[0], expiry = EXPIRIES[0]?.value) {
 
 /** Demo and authenticated market data are deliberately separate. */
 export function getDataMode() { return mode; }
+export function selectSampleExpiries(symbol, now = new Date().toISOString()) {
+  if (mode !== 'demo') return;
+  EXPIRIES.splice(0, EXPIRIES.length, ...sampleExpiries(symbol, now));
+}
 export function setDataMode(next) {
   if (!['demo', 'live'].includes(next)) throw new Error('Unknown data mode.');
   mode = next;
   MARKETS.splice(0, MARKETS.length, ...structuredClone(DEMO_MARKETS).map(m => next === 'demo' ? m : {...m, spot:null, change:null, changePercent:null, lotSize:null, iv:null, asOf:null, quoteAvailable:false}));
-  EXPIRIES.splice(0, EXPIRIES.length, ...(next === 'demo' ? structuredClone(DEMO_EXPIRIES) : []));
+  EXPIRIES.splice(0, EXPIRIES.length, ...(next === 'demo' ? sampleExpiries('NIFTY') : []));
   if (next === 'live') { contractCache.clear(); chainCache.clear(); }
 }
 export function applyIndexQuotes(indices) {
@@ -162,7 +178,9 @@ export function setContracts(symbol, contracts) { contractCache.set(symbol, cont
 export function getContracts(symbol) { return contractCache.get(symbol) || []; }
 export function selectMarketExpiries(symbol, now = new Date().toISOString()) {
   if (mode === 'demo') return;
-  const dates = [...new Set(getContracts(symbol).filter(c => Date.parse(c.expiry+'T10:00:00Z') > Date.parse(now)).map(c => c.expiry))].sort();
+  const local = new Date(Date.parse(now) + 19800000);
+  const end = new Date(Date.UTC(local.getUTCFullYear(),local.getUTCMonth()+3,0)).toISOString().slice(0,10);
+  const dates = [...new Set(getContracts(symbol).filter(c => c.expiry <= end && Date.parse(c.expiry+'T10:00:00Z') > Date.parse(now)).map(c => c.expiry))].sort();
   EXPIRIES.splice(0, EXPIRIES.length, ...dates.map(value => ({value, label:new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'}), short:new Date(value+'T00:00:00Z').toLocaleDateString('en-IN',{day:'2-digit',month:'short',timeZone:'Asia/Kolkata'})})));
 }
 export function setChain(snapshot) {
