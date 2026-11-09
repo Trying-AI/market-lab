@@ -292,7 +292,7 @@ test('version 2 live fields and immutable unit quantities survive saving and bac
   assert.equal(saved.legs[0].quoteSource, 'upstox');
   assert.equal(saved.legs[0].entryAt, '2026-10-30T04:30:00.000Z');
   assert.equal(saved.legs[0].snapshotAt, '2026-10-31T06:30:00.000Z');
-  assert.equal(saved.legs[0].expiresAt, '2026-10-30T10:00:00.000Z');
+  assert.equal(saved.legs[0].expiresAt, new Date(input.legs[0].expiresAt).toISOString());
   assert.equal(saved.legs[0].settlementPrice, 0);
   assert.equal(saved.baseDate, '2026-10-31T06:30:00.000Z');
   assert.equal(saved.dataMode, 'live');

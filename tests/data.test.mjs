@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   MARKETS, DEMO_MARKETS, EXPIRIES, DEMO_EXPIRIES, makeLeg, makeStrategy,
   getChain, getDataMode, setDataMode, applyIndexQuotes, setContracts,
-  getContracts, selectMarketExpiries, setChain, getOptionQuote, getStrikeOptions,
+  getContracts, selectMarketExpiries, selectSampleExpiries, sampleExpiries, setChain, getOptionQuote, getStrikeOptions,
 } from '../src/data.js';
 import { optionPrice, expiryYears } from '../src/engine.js';
 
@@ -64,6 +64,24 @@ test('live expiry selection uses listed dates, removes duplicates and excludes s
   assert.deepEqual(EXPIRIES.map(expiry => expiry.value), [EXPIRY, NEXT_EXPIRY]);
   selectMarketExpiries('SENSEX', BASE_DATE);
   assert.deepEqual(EXPIRIES, []);
+});
+
+test('sample expiry snapshot uses listed dates for each index and excludes contracts after expiry', () => {
+  const afterClose = '2026-11-09T10:00:00.000Z';
+  assert.deepEqual(sampleExpiries('NIFTY', afterClose).map(e => e.value), ['2026-11-17','2026-11-23','2026-12-01','2026-12-08','2026-12-29','2027-01-25']);
+  assert.deepEqual(sampleExpiries('BANKNIFTY', afterClose).map(e => e.value), ['2026-11-23','2026-12-29','2027-01-25']);
+  assert.deepEqual(sampleExpiries('SENSEX', afterClose).map(e => e.value), ['2026-11-12','2026-11-19','2026-11-26','2026-12-03','2026-12-10','2026-12-17','2026-12-24','2026-12-31','2027-01-28']);
+  assert.equal(sampleExpiries('NIFTY', '2026-11-09T09:59:59Z')[0].value, '2026-11-09');
+  assert.deepEqual(sampleExpiries('SENSEX', '2027-02-01T00:00:00Z'), []);
+  selectSampleExpiries('BANKNIFTY', afterClose);
+  assert.deepEqual(EXPIRIES.map(e => e.value), ['2026-11-23','2026-12-29','2027-01-25']);
+});
+
+test('live expiry choices stop at the end of the second following month', () => {
+  setDataMode('live');
+  setContracts('NIFTY', [...contracts('2030-03-31'), ...contracts('2030-04-01')]);
+  selectMarketExpiries('NIFTY', BASE_DATE);
+  assert.deepEqual(EXPIRIES.map(e => e.value), ['2030-03-31']);
 });
 
 test('live strike selection returns only the listed contracts for the selected expiry and type', () => {
