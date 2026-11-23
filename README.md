@@ -2,7 +2,7 @@
 
 A free browser-based options strategy playground with an original visual design. Build a position, explore its risk, and save it for later. The public app and sample mode have no subscription or Folio account requirement.
 
-**Actual market prices require your own Upstox account and free personal Analytics Token.** The default workspace starts disconnected and shows unavailable prices, rather than substituting sample quotes. Sample mode remains available without a broker account. An anonymous free live-data feed has not been verified or provided.
+The default workspace uses the **23 November 2026 index closes** for NIFTY, BANKNIFTY and SENSEX. New option legs use listed contracts and modeled premiums. A free personal Upstox Analytics Token enables live option quotes and market P&L.
 
 ## Run locally
 
@@ -34,7 +34,7 @@ Keep the terminal running while using the app. ES modules require an HTTP server
 - Inspect maximum profit, maximum loss, breakevens, net debit/credit, reward/risk, model probability of profit, and option Greeks. Unlimited call upside or loss is identified explicitly.
 - Save named positions in the browser, reopen them later, and export or import JSON backups.
 
-Live strike dropdowns contain the exact listed contracts returned for the selected index, expiry, and option type. The chain shows up to 25 strikes near spot. An explicitly selected missing strike is rejected rather than silently replaced. Presets may be unavailable when their required strikes have no listed contract or usable quote. Sample mode offers 61 illustrative strike choices around its sample spot.
+Live strike dropdowns contain the exact listed contracts returned for the selected index, expiry, and option type. The chain shows up to 25 strikes near spot. An explicitly selected missing strike is rejected rather than silently replaced. Presets may be unavailable when their required strikes have no listed contract or usable quote. The closing snapshot offers the strikes listed for each index, expiry and option type.
 
 Saved positions use `localStorage`. They persist across refreshes in the same browser profile and site origin. Private browsing, clearing site data, changing browsers, or switching between `localhost` and `127.0.0.1` can produce a separate or empty collection. Export JSON backups to keep a portable copy. Positions are not synced to an account or cloud service.
 
@@ -44,7 +44,7 @@ Entry premiums and unit quantities remain fixed when quotes or current contract 
 
 1. Create or sign in to an Upstox account yourself. Account registration and any verification happen on Upstox, outside this app.
 2. Follow the [official Upstox Analytics Token guide](https://upstox.com/developer/api-documentation/analytics-token/): open [Developer Apps](https://account.upstox.com/developer/apps), choose **Analytics**, generate a token, and copy it. Upstox documents this token as free and read-only.
-3. Choose **Connect market data** in Folio and paste your personal Analytics Token. Connecting opens a fresh market workspace; your saved positions remain in the library.
+3. Choose **Connect live feed**, then **Connect market data** in Folio and paste your personal Analytics Token. Connecting opens a fresh market workspace; your saved positions remain in the library.
 
 The browser makes authenticated GET requests directly to `api.upstox.com`. The token stays in memory for that tab and is lost when the page refreshes. It is never written to the repository, browser storage, position backups, or a shared server. Do not commit or share a token. The app does not place orders or redistribute a shared account's market feed.
 
@@ -64,7 +64,9 @@ Expired positions need an official settlement value before their market P&L can 
 
 Market mode passes an explicit current valuation clock to the pricing engine. Quote freshness is checked against the actual current time, independently of the model's valuation baseline. Model outputs require usable index data and IV assumptions; unavailable market inputs are not replaced with sample values.
 
-The separate **Sample mode** uses illustrative index prices dated **26 October 2026** and models option values using the current valuation time. The expiry choices are a static snapshot of currently listed Upstox contracts as of **9 November 2026**, through January 2027; expired choices are hidden as time passes. NIFTY and SENSEX have the listed weekly and monthly expiries, while BANKNIFTY has listed monthly expiries. Exchanges can list further contracts or change dates, so this snapshot is not an automatic contract feed. Sample option prices, IV and open interest remain illustrative. The engine retains `DEMO_DATE` as its default for backward compatibility and deterministic tests; application callers pass their valuation time explicitly. Expiry valuation uses 15:30 IST on the selected date unless an explicit contract expiry timestamp is supplied.
+The **closing snapshot** uses the 23 November 2026 published levels for [NIFTY 50](https://upstox.com/indices/nifty-50-share-price/), [BANK NIFTY](https://upstox.com/indices/nifty-bank-share-price/) and [SENSEX](https://upstox.com/indices/sensex-share-price/). Option premiums use the current valuation time and assumed IV. The public snapshot contains no open-interest observations or traded option premiums.
+
+Both the snapshot and the personal feed show each index’s listed expiries from now through the last day of the third following calendar month, using Indian Standard Time. For November 2026 the window ends on 28 February 2027. A contract leaves the dropdown at 15:30 IST on its expiry date. The dated [Upstox instrument files](https://upstox.com/developer/api-documentation/instruments/) supply the offline expiry dates, strikes and lot sizes. Unlisted months appear as empty groups. Loading a position preserves its original trades and entries. The option-chain expiry selector lets you browse other expiries independently of those legs. A new static snapshot is needed to add later listings without a personal feed.
 
 The pricing engine uses European Black–Scholes with zero dividends, constant IV for each modeled scenario, and a default continuously compounded annual risk-free rate of **6%**, adjustable in calculation settings. It assumes 365 calendar days per year. It does not include early exercise, transaction fees, brokerage, taxes, bid/ask spread, slippage, funding costs, or exchange margin requirements. All reported P&L excludes these costs.
 
@@ -107,6 +109,8 @@ server.mjs            Local static development server
 src/app.js            Interface, interactions, saved positions, and backups
 src/styles.css        Responsive visual design
 src/data.js           Separate sample/live state, contracts, chains, and presets
+src/listed-contracts.js  Dated instrument listings by index, expiry and option type
+src/index-closes.js    Index closing levels, as-of date and source links
 src/market-data.js    Personal read-only Upstox browser adapter
 src/engine.js         Option models, calibration, quantity handling, and LTP MTM
 src/storage.js        Validated browser persistence and JSON backups
