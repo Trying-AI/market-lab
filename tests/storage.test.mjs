@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { STORAGE_KEY, readPositions, writePositions, validatePosition, validateWorkspace, parseImport, makeBackup } from '../src/storage.js';
-import { MARKETS, makeStrategy } from '../src/data.js';
+import { MARKETS } from '../src/data.js';
 
 function position(overrides = {}) {
   return {
@@ -9,7 +9,10 @@ function position(overrides = {}) {
     name: 'My call spread',
     marketSymbol: 'NIFTY',
     expiry: '2026-10-30',
-    legs: makeStrategy(),
+    legs: [
+      {id:'long-call', side:'buy', type:'CE', strike:24500, premium:173.49, lots:1, iv:14, enabled:true, expiry:'2026-10-30'},
+      {id:'short-call', side:'sell', type:'CE', strike:24800, premium:57.20, lots:1, iv:15, enabled:true, expiry:'2026-10-30'},
+    ],
     notes: 'Watch the upper strike.',
     createdAt: '2026-10-26T06:30:00Z',
     updatedAt: '2026-10-26T07:30:00Z',
@@ -52,7 +55,7 @@ test('workspace validation still rejects malformed legs, oversized drafts, and i
   invalidLeg.legs[0].premium = Infinity;
   assert.throws(() => validateWorkspace(invalidLeg), /Leg 1 premium/);
   assert.throws(() => validateWorkspace(position({ legs: new Array(1) })), /Leg 1 must be an object/);
-  assert.throws(() => validateWorkspace(position({ legs: Array.from({ length: 25 }, () => makeStrategy()[0]) })), /0–24/);
+  assert.throws(() => validateWorkspace(position({ legs: Array.from({ length: 25 }, () => position().legs[0]) })), /0–24/);
   assert.throws(() => validateWorkspace(position({ legs: [], marketSymbol: 'UNKNOWN' })), /market/);
   assert.throws(() => validateWorkspace(position({ legs: [], expiry: '2026-02-30' })), /date/);
   assert.throws(() => validateWorkspace(position({ legs: [], rate: NaN })), /Interest rate/);
@@ -174,7 +177,7 @@ test('collection and leg limits, duplicate IDs, and string bounds are enforced',
   assert.throws(() => makeBackup(Array.from({length:501}, (_,index) => position({id:`p-${index}`}))), /500/);
   assert.throws(() => makeBackup([position(), position()]), /unique ID/);
   assert.throws(() => validatePosition(position({legs:[]})), /1–24/);
-  assert.throws(() => validatePosition(position({legs:Array.from({length:25}, () => makeStrategy()[0])})), /1–24/);
+  assert.throws(() => validatePosition(position({legs:Array.from({length:25}, () => position().legs[0])})), /1–24/);
   const duplicate = position(); duplicate.legs[1].id = duplicate.legs[0].id;
   assert.throws(() => validatePosition(duplicate), /unique ID/);
   assert.throws(() => validatePosition(position({name:'x'.repeat(81)})), /1–80/);

@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  MARKETS, DEMO_MARKETS, EXPIRIES, DEMO_EXPIRIES, makeLeg, makeStrategy,
+  MARKETS, DEMO_MARKETS, EXPIRIES, makeLeg, makeStrategy, expiryWindowEnd,
   getChain, getDataMode, setDataMode, applyIndexQuotes, setContracts,
   getContracts, selectMarketExpiries, selectSampleExpiries, sampleExpiries, setChain, getOptionQuote, getStrikeOptions,
 } from '../src/data.js';
 import { optionPrice, expiryYears } from '../src/engine.js';
+import { listingAsOf, listedExpiries, listedStrikes, listedLotSizes } from '../src/listed-contracts.js';
+import { indexCloses } from '../src/index-closes.js';
 
 // Synthetic fixtures only: none of the numbers or contracts below are exchange data.
 const BASE_DATE = '2030-01-02T06:30:00.000Z';
@@ -43,7 +45,13 @@ function loadLive() {
 test.beforeEach(() => setDataMode('demo'));
 test.afterEach(() => setDataMode('demo'));
 
-test('entering live mode removes all demo quotes, expiries and generated chains', () => {
+function useSnapshotDate(t) {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(listingAsOf + 'T03:45:00Z') });
+  setDataMode('demo');
+}
+
+test('entering live mode removes all demo quotes, expiries and generated chains', t => {
+  useSnapshotDate(t);
   assert.equal(getDataMode(), 'demo');
   assert.equal(getChain().length, 17);
   setDataMode('live');
@@ -66,22 +74,60 @@ test('live expiry selection uses listed dates, removes duplicates and excludes s
   assert.deepEqual(EXPIRIES, []);
 });
 
-test('sample expiry snapshot uses listed dates for each index and excludes contracts after expiry', () => {
-  const afterClose = '2026-11-09T10:00:00.000Z';
-  assert.deepEqual(sampleExpiries('NIFTY', afterClose).map(e => e.value), ['2026-11-17','2026-11-23','2026-12-01','2026-12-08','2026-12-29','2027-01-25']);
-  assert.deepEqual(sampleExpiries('BANKNIFTY', afterClose).map(e => e.value), ['2026-11-23','2026-12-29','2027-01-25']);
-  assert.deepEqual(sampleExpiries('SENSEX', afterClose).map(e => e.value), ['2026-11-12','2026-11-19','2026-11-26','2026-12-03','2026-12-10','2026-12-17','2026-12-24','2026-12-31','2027-01-28']);
-  assert.equal(sampleExpiries('NIFTY', '2026-11-09T09:59:59Z')[0].value, '2026-11-09');
-  assert.deepEqual(sampleExpiries('SENSEX', '2027-02-01T00:00:00Z'), []);
-  selectSampleExpiries('BANKNIFTY', afterClose);
-  assert.deepEqual(EXPIRIES.map(e => e.value), ['2026-11-23','2026-12-29','2027-01-25']);
+test('snapshot selectors use each instrument’s own listed expiries and expiry-day IST cutoff', () => {
+  for (const { symbol } of MARKETS) {
+    const dates = listedExpiries[symbol];
+    assert.ok(dates.length > 0);
+    selectSampleExpiries(symbol, listingAsOf + 'T00:00:00Z');
+    assert.deepEqual(EXPIRIES.map(e => e.value), dates.filter(date => date >= listingAsOf && date <= expiryWindowEnd(listingAsOf)));
+    const next = EXPIRIES[0].value;
+    assert.equal(sampleExpiries(symbol, next + 'T15:29:59+05:30')[0].value, next);
+    assert.ok(sampleExpiries(symbol, next + 'T15:30:00+05:30').every(e => e.value > next));
+    assert.deepEqual(sampleExpiries(symbol, dates.at(-1) + 'T15:30:00+05:30'), []);
+  }
 });
 
-test('live expiry choices stop at the end of the second following month', () => {
+test('expiry window includes the rest of the Indian current month plus three complete calendar months', () => {
   setDataMode('live');
-  setContracts('NIFTY', [...contracts('2030-03-31'), ...contracts('2030-04-01')]);
-  selectMarketExpiries('NIFTY', BASE_DATE);
-  assert.deepEqual(EXPIRIES.map(e => e.value), ['2030-03-31']);
+  setContracts('NIFTY', ['2026-11-23', '2026-11-26', '2026-12-01', '2027-01-27', '2027-02-28', '2027-03-01'].flatMap(contracts));
+  selectMarketExpiries('NIFTY', '2026-11-23T15:30:00+05:30');
+  assert.deepEqual(EXPIRIES.map(e => e.value), ['2026-11-26', '2026-12-01', '2027-01-27', '2027-02-28']);
+  assert.equal(expiryWindowEnd('2026-11-30T18:29:59Z'), '2027-02-28');
+  assert.equal(expiryWindowEnd('2026-11-30T18:30:00Z'), '2027-03-31');
+  assert.equal(expiryWindowEnd('2027-11-23T10:00:00Z'), '2028-02-29');
+});
+
+test('snapshot strike selects, chain and entries use listed strikes and contract quantities', t => {
+  useSnapshotDate(t);
+  for (const market of MARKETS) {
+    const { symbol } = market;
+    assert.equal(market.spot, indexCloses[symbol].spot);
+    for (const { value: expiry } of sampleExpiries(symbol)) {
+      const chain = getChain(symbol, expiry);
+      assert.ok(chain.length > 0);
+      for (const type of ['CE', 'PE']) {
+        const strikes = getStrikeOptions(symbol, expiry, type);
+        assert.deepEqual(strikes, listedStrikes[symbol][expiry][type]);
+        const leg = makeLeg(symbol, expiry, { type, lots: 2 });
+        assert.ok(strikes.includes(leg.strike));
+        assert.equal(leg.lotSize, listedLotSizes[symbol][expiry]);
+        assert.equal(leg.quantityUnits, leg.lotSize * 2);
+        assert.equal(leg.entryPriceSource, 'legacy-demo');
+        for (const row of chain) {
+          const quote = type === 'CE' ? row.call : row.put;
+          assert.equal(quote !== null, strikes.includes(row.strike));
+          if (quote) assert.equal(quote.oi, null);
+        }
+        assert.throws(() => makeLeg(symbol, expiry, { type, strike: 1 }), /not listed/);
+      }
+    }
+  }
+  t.mock.timers.setTime(new Date('2100-01-01T00:00:00Z').getTime());
+  selectSampleExpiries('NIFTY');
+  assert.deepEqual(EXPIRIES, []);
+  assert.deepEqual(getChain(), []);
+  assert.deepEqual(getStrikeOptions('NIFTY', listedExpiries.NIFTY[0], 'CE'), []);
+  assert.throws(() => makeLeg(), /No current listed contracts/);
 });
 
 test('live strike selection returns only the listed contracts for the selected expiry and type', () => {
@@ -190,7 +236,8 @@ test('out-of-range provider IV becomes unavailable without changing the actual q
   }
 });
 
-test('switching to demo restores every frozen example and re-entering live discards old caches', () => {
+test('switching to demo restores the dated index snapshot and re-entering live discards old caches', t => {
+  useSnapshotDate(t);
   const original = structuredClone(MARKETS);
   const oldPremium = makeLeg().premium;
   loadLive();
@@ -199,7 +246,7 @@ test('switching to demo restores every frozen example and re-entering live disca
   setDataMode('demo');
   assert.deepEqual(MARKETS, original);
   assert.deepEqual(MARKETS, DEMO_MARKETS);
-  assert.deepEqual(EXPIRIES, DEMO_EXPIRIES);
+  assert.deepEqual(EXPIRIES, sampleExpiries('NIFTY'));
   assert.equal(makeLeg().premium, oldPremium);
   assert.equal(makeLeg().entryPriceSource, 'legacy-demo');
   assert.equal(getChain().length, 17);
